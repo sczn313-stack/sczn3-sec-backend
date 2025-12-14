@@ -54,7 +54,22 @@ app.post("/api/sec", (req, res) => {
   }
 });
 
-// Start server
+// Start server // --- Upload endpoint (must be ABOVE app.listen) ---
+const multer = require("multer");
+const upload = multer({ storage: multer.memoryStorage() });
+
+app.post("/api/upload", upload.single("image"), (req, res) => {
+  if (!req.file) {
+    return res.status(400).json({ ok: false, error: "No file uploaded" });
+  }
+
+  return res.json({
+    ok: true,
+    filename: req.file.originalname,
+    mimetype: req.file.mimetype,
+    size: req.file.size,
+  });
+});
 app.listen(PORT, () => {
   console.log(`SCZN3 SEC backend listening on port ${PORT}`);
 });
