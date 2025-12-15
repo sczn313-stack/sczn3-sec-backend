@@ -1,39 +1,99 @@
-app.post("/api/sec", upload.single("image"), (req, res) => {
+import express from "express";
 
-  if (!req.file) {
+import cors from "cors";
 
-    return res.status(400).json({ ok: false, error: "No file uploaded" });
-
-  }
+import multer from "multer";
 
 
 
-  // Deterministic fake clicks based on file size + filename length
+const app = express();
 
-  const seed = (req.file.size || 0) + (req.file.originalname?.length || 0);
-
-
-
-  // Up: 0.25 to 4.24
-
-  const up = (((seed % 400) / 100) + 0.25).toFixed(2);
+const PORT = process.env.PORT || 10000;
 
 
 
-  // Right: -0.10 to -3.09
+app.use(cors({ origin: true }));
 
-  const right = (-(((seed % 300) / 100) + 0.10)).toFixed(2);
+app.use(express.json());
 
 
 
-  return res.json({
+const upload = multer({
+
+  storage: multer.memoryStorage(),
+
+  limits: { fileSize: 10 * 1024 * 1024 } // 10MB
+
+});
+
+
+
+app.get("/__build", (req, res) => {
+
+  res.json({ build: "sec-fakeclicks-v1" });
+
+});
+
+
+
+app.get("/", (req, res) => {
+
+  res.json({ status: "ok", service: "SCZN3 backend" });
+
+});
+
+
+
+app.get("/health", (req, res) => {
+
+  res.json({ ok: true });
+
+});
+
+
+
+app.post("/api/upload", upload.single("image"), (req, res) => {
+
+  if (!req.file) return res.status(400).json({ ok: false, error: "No file uploaded" });
+
+
+
+  res.json({
 
     ok: true,
 
-    up,
+    message: "Image received",
 
-    right,
+    filename: req.file.originalname,
+
+    mimetype: req.file.mimetype,
+
+    size: req.file.size
 
   });
 
 });
+
+
+
+app.post("/api/sec", upload.single("image"), (req, res) => {
+
+  if (!req.file) return res.status(400).json({ ok: false, error: "No file uploaded" });
+
+
+
+  // fake demo clicks (two decimals)
+
+  const up = 1.25;
+
+  const right = -0.75;
+
+
+
+  res.json({ ok: true, up: up.toFixed(2), right: right.toFixed(2) });
+
+});
+
+
+
+app.listen(PORT, () => console.log(`SCZN3 backend running on port ${PORT}`));
