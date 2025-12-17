@@ -1,6 +1,6 @@
-const express = require("express");
+mport express from "express";
 
-const cors = require("cors");
+import cors from "cors";
 
 
 
@@ -36,6 +36,10 @@ app.get("/health", (req, res) => {
 
  *  - Dial the direction you want the impact to move (opposite of observed offset).
 
+ *
+
+ * Response is clicks only, always two decimals.
+
  */
 
 app.post("/api/sec/compute", (req, res) => {
@@ -58,6 +62,8 @@ app.post("/api/sec/compute", (req, res) => {
 
 
 
+  // 1 MOA = 1.047" @ 100 yards
+
   const inchesPerMOA = 1.047 * (distance_yards / 100);
 
 
@@ -67,6 +73,8 @@ app.post("/api/sec/compute", (req, res) => {
   const y_moa = impact_y_in / inchesPerMOA;
 
 
+
+  // Negative because you dial opposite of observed offset
 
   const windage_clicks_signed = (-x_moa) / click_value_moa;
 
@@ -90,13 +98,11 @@ function formatDial(axis, clicksSigned) {
 
   const abs = Math.abs(clicksSigned);
 
+  const clicks = abs.toFixed(2); // ALWAYS two decimals
 
 
-  // Always two decimals (your standard)
 
-  const clicks = abs.toFixed(2);
-
-
+  // Treat tiny values as zero
 
   if (abs < 0.0005) {
 
@@ -132,4 +138,8 @@ function formatDial(axis, clicksSigned) {
 
 const port = Number(process.env.PORT) || 3000;
 
-app.listen(port, () => console.log(`SEC backend listening on ${port}`));
+app.listen(port, () => {
+
+  console.log(`SEC backend listening on ${port}`);
+
+});
