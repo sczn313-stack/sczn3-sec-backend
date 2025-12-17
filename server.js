@@ -1,4 +1,4 @@
-mport express from "express";
+import express from "express";
 
 import cors from "cors";
 
@@ -11,6 +11,24 @@ const app = express();
 app.use(cors());
 
 app.use(express.json());
+
+
+
+// Root route so visiting the base URL doesn't show "Not Found"
+
+app.get("/", (req, res) => {
+
+  res.json({
+
+    ok: true,
+
+    service: "sczn3-sec-backend",
+
+    routes: ["/health", "/api/sec/compute"],
+
+  });
+
+});
 
 
 
