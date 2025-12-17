@@ -1,42 +1,16 @@
-import express from "express";
+const express = require("express");
 
-import cors from "cors";
-
-import multer from "multer";
+const cors = require("cors");
 
 
 
 const app = express();
 
-const PORT = process.env.PORT || 10000;
 
 
-
-app.use(cors({ origin: true }));
+app.use(cors());
 
 app.use(express.json());
-
-
-
-// Multer: keep uploads in memory (good for now)
-
-const upload = multer({
-
-  storage: multer.memoryStorage(),
-
-  limits: { fileSize: 10 * 1024 * 1024 }, // 10MB
-
-});
-
-
-
-// ---------- GET: sanity routes ----------
-
-app.get("/", (req, res) => {
-
-  res.json({ status: "ok", service: "SCZN3 backend" });
-
-});
 
 
 
@@ -48,84 +22,114 @@ app.get("/health", (req, res) => {
 
 
 
-// ---------- POST: upload test ----------
+/**
 
-app.post("/api/upload", upload.single("image"), (req, res) => {
+ * Input convention:
 
-  try {
+ *  - impact_x_in: + = impact RIGHT of aimpoint, - = LEFT
 
-    if (!req.file) {
+ *  - impact_y_in: + = impact HIGH of aimpoint,  - = LOW
 
-      return res.status(400).json({ ok: false, error: "No file uploaded" });
+ *
 
-    }
+ * Output convention (dial direction):
+
+ *  - Dial the direction you want the impact to move (opposite of observed offset).
+
+ */
+
+app.post("/api/sec/compute", (req, res) => {
+
+  const { impact_x_in, impact_y_in, distance_yards, click_value_moa } = req.body || {};
 
 
 
-    return res.json({
+  const nums = [impact_x_in, impact_y_in, distance_yards, click_value_moa];
 
-      ok: true,
+  if (nums.some((v) => typeof v !== "number" || !Number.isFinite(v))) {
 
-      message: "Image received",
-
-      filename: req.file.originalname,
-
-      mimetype: req.file.mimetype,
-
-      size: req.file.size,
-
-    });
-
-  } catch (err) {
-
-    return res.status(500).json({ ok: false, error: "Upload failed" });
+    return res.status(400).json({ error: "All inputs must be finite numbers." });
 
   }
 
+  if (distance_yards <= 0) return res.status(400).json({ error: "distance_yards must be > 0" });
+
+  if (click_value_moa <= 0) return res.status(400).json({ error: "click_value_moa must be > 0" });
+
+
+
+  const inchesPerMOA = 1.047 * (distance_yards / 100);
+
+
+
+  const x_moa = impact_x_in / inchesPerMOA;
+
+  const y_moa = impact_y_in / inchesPerMOA;
+
+
+
+  const windage_clicks_signed = (-x_moa) / click_value_moa;
+
+  const elevation_clicks_signed = (-y_moa) / click_value_moa;
+
+
+
+  const windage = formatDial("windage", windage_clicks_signed);
+
+  const elevation = formatDial("elevation", elevation_clicks_signed);
+
+
+
+  return res.json({ windage, elevation });
+
 });
 
 
 
-// ---------- POST: SEC stub (fake clicks) ----------
+function formatDial(axis, clicksSigned) {
 
-app.post("/api/sec", upload.single("image"), (req, res) => {
-
-  try {
-
-    if (!req.file) {
-
-      return res.status(400).json({ ok: false, error: "No file uploaded" });
-
-    }
+  const abs = Math.abs(clicksSigned);
 
 
 
-    // Fake non-zero click outputs (string w/ 2 decimals)
+  // Always two decimals (your standard)
 
-    // Use fixed values so your frontend is easy to test.
+  const clicks = abs.toFixed(2);
 
-    return res.json({
 
-      ok: true,
 
-      up: "1.25",
+  if (abs < 0.0005) {
 
-      right: "-0.75",
-
-    });
-
-  } catch (err) {
-
-    return res.status(500).json({ ok: false, error: "SEC failed" });
+    return { direction: axis === "windage" ? "RIGHT" : "UP", clicks: "0.00" };
 
   }
 
-});
+
+
+  const direction =
+
+    axis === "windage"
+
+      ? clicksSigned > 0
+
+        ? "RIGHT"
+
+        : "LEFT"
+
+      : clicksSigned > 0
+
+      ? "UP"
+
+      : "DOWN";
 
 
 
-app.listen(PORT, () => {
+  return { direction, clicks };
 
-  console.log(`SCZN3 backend listening on ${PORT}`);
+}
 
-});
+
+
+const port = Number(process.env.PORT) || 3000;
+
+app.listen(port, () => console.log(`SEC backend listening on ${port}`));
