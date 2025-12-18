@@ -1,31 +1,38 @@
-
 // server.js
 import express from "express";
 import cors from "cors";
 import multer from "multer";
 
 const app = express();
-const upload = multer({ storage: multer.memoryStorage() });
 
+// CORS: allow all for now (safe for dev). Tighten later.
 app.use(cors());
-app.use(express.json({ limit: "10mb" }));
+app.use(express.json({ limit: "2mb" }));
 
-// Health / home
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 8 * 1024 * 1024 }, // 8MB
+});
+
 app.get("/", (req, res) => {
   res.status(200).send("SCZN3 SEC Backend is up");
 });
 
-app.get("/health", (req, res) => {
-  res.status(200).json({ ok: true });
+// Simple health + route list
+app.get("/api/health", (req, res) => {
+  res.json({
+    ok: true,
+    routes: ["GET /", "GET /api/health", "POST /api/upload", "POST /api/sec"],
+  });
 });
 
-// Upload endpoint (matches frontend /api/upload)
+// Upload test endpoint
 app.post("/api/upload", upload.single("file"), (req, res) => {
   if (!req.file) {
-    return res.status(400).json({ ok: false, error: "No file received (field name must be 'file')." });
+    return res.status(400).json({ ok: false, error: "No file received (field name must be: file)" });
   }
 
-  return res.status(200).json({
+  res.json({
     ok: true,
     received: {
       originalname: req.file.originalname,
@@ -35,23 +42,25 @@ app.post("/api/upload", upload.single("file"), (req, res) => {
   });
 });
 
-// SEC endpoint (matches frontend /api/sec)
-app.post("/api/sec", (req, res) => {
-  // Placeholder response so the pipeline works end-to-end.
-  // Replace this logic later with your real SEC math.
-  return res.status(200).json({
+// SEC endpoint (placeholder response so the pipeline works end-to-end)
+app.post("/api/sec", upload.single("file"), (req, res) => {
+  // Accept file OR JSON. For now we just prove the endpoint works.
+  const hasFile = !!req.file;
+
+  res.json({
     ok: true,
+    mode: hasFile ? "multipart" : "json",
     sec: {
-      windage_clicks: 0.0,
-      elevation_clicks: 0.0,
+      windage_clicks: -0.25,
+      elevation_clicks: +0.50,
     },
-    note: "SEC endpoint is wired. Math not implemented yet.",
+    note: "SEC endpoint is live (placeholder output). Wire real SCZN3 math next.",
   });
 });
 
-// Helpful 404 for anything else
+// 404 handler
 app.use((req, res) => {
-  res.status(404).json({ ok: false, error: `Route not found: ${req.method} ${req.path}` });
+  res.status(404).json({ ok: false, error: `Not found: ${req.method} ${req.path}` });
 });
 
 const PORT = process.env.PORT || 10000;
