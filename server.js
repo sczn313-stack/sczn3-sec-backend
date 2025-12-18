@@ -1,62 +1,60 @@
-// server.js (CommonJS)
 
-const express = require("express");
-const cors = require("cors");
-const multer = require("multer");
+// server.js
+import express from "express";
+import cors from "cors";
+import multer from "multer";
 
 const app = express();
+const upload = multer({ storage: multer.memoryStorage() });
 
-// --- CORS (allow your static site to call this API) ---
-app.use(
-  cors({
-    origin: "*",
-    methods: ["GET", "POST", "OPTIONS"],
-    allowedHeaders: ["Content-Type"],
-  })
-);
-app.options("*", cors());
+app.use(cors());
+app.use(express.json({ limit: "10mb" }));
 
-// --- middleware ---
-app.use(express.json());
-
-// --- health check (keep permanently) ---
-app.get("/health", (_req, res) => {
-  return res.status(200).json({ status: "ok" });
+// Health / home
+app.get("/", (req, res) => {
+  res.status(200).send("SCZN3 SEC Backend is up");
 });
 
-// --- quick root check ---
-app.get("/", (_req, res) => {
-  return res.status(200).send("SCZN3 SEC Backend is up");
+app.get("/health", (req, res) => {
+  res.status(200).json({ ok: true });
 });
 
-// --- upload endpoint (matches your Upload Test page) ---
-const upload = multer({
-  storage: multer.memoryStorage(),
-  limits: { fileSize: 20 * 1024 * 1024 }, // 20MB
-});
-
-function handleUpload(req, res) {
-  const file = req.file;
-  if (!file) {
-    return res.status(400).json({ ok: false, error: "No file received. Expected field name: file" });
+// Upload endpoint (matches frontend /api/upload)
+app.post("/api/upload", upload.single("file"), (req, res) => {
+  if (!req.file) {
+    return res.status(400).json({ ok: false, error: "No file received (field name must be 'file')." });
   }
 
   return res.status(200).json({
     ok: true,
     received: {
-      originalname: file.originalname,
-      mimetype: file.mimetype,
-      size: file.size,
+      originalname: req.file.originalname,
+      mimetype: req.file.mimetype,
+      size: req.file.size,
     },
   });
-}
+});
 
-// Accept BOTH routes in case your frontend uses either
-app.post("/upload", upload.single("file"), handleUpload);
-app.post("/api/upload", upload.single("file"), handleUpload);
+// SEC endpoint (matches frontend /api/sec)
+app.post("/api/sec", (req, res) => {
+  // Placeholder response so the pipeline works end-to-end.
+  // Replace this logic later with your real SEC math.
+  return res.status(200).json({
+    ok: true,
+    sec: {
+      windage_clicks: 0.0,
+      elevation_clicks: 0.0,
+    },
+    note: "SEC endpoint is wired. Math not implemented yet.",
+  });
+});
 
-// --- Render port binding ---
-const PORT = Number(process.env.PORT || 3000);
-app.listen(PORT, "0.0.0.0", () => {
+// Helpful 404 for anything else
+app.use((req, res) => {
+  res.status(404).json({ ok: false, error: `Route not found: ${req.method} ${req.path}` });
+});
+
+const PORT = process.env.PORT || 10000;
+app.listen(PORT, () => {
   console.log(`SCZN3 SEC Backend listening on port ${PORT}`);
 });
