@@ -13,7 +13,7 @@ const upload = multer({
 });
 
 // =========================
-// SCZN3 defaults (v1.2)
+// SCZN3 defaults
 // =========================
 const DISTANCE_YARDS = Number(process.env.DISTANCE_YARDS ?? 100);
 const MOA_PER_CLICK = Number(process.env.MOA_PER_CLICK ?? 0.25);
@@ -23,31 +23,34 @@ const TARGET_WIDTH_IN = Number(process.env.TARGET_WIDTH_IN ?? 23);
 // Detection / validation tuning
 // =========================
 const MAX_W = Number(process.env.MAX_W ?? 1400);
-
-// How much padding around the detected “ink” bbox
 const INK_PAD_PCT = Number(process.env.INK_PAD_PCT ?? 0.03);
 
-// Otsu threshold clamping (avoids crazy thresholds)
 const OTSU_CLAMP_MIN = Number(process.env.OTSU_CLAMP_MIN ?? 35);
 const OTSU_CLAMP_MAX = Number(process.env.OTSU_CLAMP_MAX ?? 150);
 
-// Required shots
 const MIN_SHOTS = Number(process.env.MIN_SHOTS ?? 3);
 const MAX_SHOTS = Number(process.env.MAX_SHOTS ?? 7);
 
-// Blob filters (relative to target crop area)
 const MIN_AREA_PCT = Number(process.env.MIN_AREA_PCT ?? 0.00003);
 const MAX_AREA_PCT = Number(process.env.MAX_AREA_PCT ?? 0.006);
 const MAX_ASPECT = Number(process.env.MAX_ASPECT ?? 3.0);
 const MIN_FILL = Number(process.env.MIN_FILL ?? 0.20);
 
-// HARD sanity clamp (clicks)
 const MAX_ABS_CLICKS = Number(process.env.MAX_ABS_CLICKS ?? 80);
 
-// “Is this really a target?” gates
-const MIN_BBOX_AREA_FRAC = Number(process.env.MIN_BBOX_AREA_FRAC ?? 0.18); // bbox must cover >= 18% of image
+// “Is this really a target?” bbox gates
+const MIN_BBOX_AREA_FRAC = Number(process.env.MIN_BBOX_AREA_FRAC ?? 0.18);
 const BBOX_ASPECT_MIN = Number(process.env.BBOX_ASPECT_MIN ?? 0.80);
 const BBOX_ASPECT_MAX = Number(process.env.BBOX_ASPECT_MAX ?? 1.25);
+
+// NEW: Paper/Ink gate (prevents random photos)
+const PAPER_WHITE_THRESH = Number(process.env.PAPER_WHITE_THRESH ?? 230);
+const PAPER_WHITE_FRAC_MIN = Number(process.env.PAPER_WHITE_FRAC_MIN ?? 0.28); // % of pixels that look like paper
+const DARK_THRESH = Number(process.env.DARK_THRESH ?? 80);
+const DARK_FRAC_MAX = Number(process.env.DARK_FRAC_MAX ?? 0.25); // random photos often exceed this
+
+// NEW: Noise gate (random textures create tons of blobs)
+const MAX_CANDIDATES = Number(process.env.MAX_CANDIDATES ?? 60);
 
 app.get("/", (req, res) => res.status(200).send("SCZN3 SEC Backend is up"));
 
@@ -62,6 +65,11 @@ app.get("/api/health", (req, res) => {
       MIN_SHOTS,
       MAX_SHOTS,
       MAX_ABS_CLICKS,
+      PAPER_WHITE_THRESH,
+      PAPER_WHITE_FRAC_MIN,
+      DARK_THRESH,
+      DARK_FRAC_MAX,
+      MAX_CANDIDATES,
     },
   });
 });
@@ -75,11 +83,9 @@ function round2(n) {
   return Math.round(x * 100) / 100;
 }
 function inchesPerMOA(distanceYds) {
-  // 1 MOA = 1.047" at 100 yards (scaled by distance/100)
   return 1.047 * (distanceYds / 100);
 }
 
-// Otsu threshold (grayscale)
 function otsuThreshold(grayArray) {
   const hist = new Uint32Array(256);
   for (let i = 0; i < grayArray.length; i++) hist[grayArray[i]]++;
@@ -98,7 +104,6 @@ function otsuThreshold(grayArray) {
   for (let t = 0; t < 256; t++) {
     wB += hist[t];
     if (wB === 0) continue;
-
     wF = total - wB;
     if (wF === 0) break;
 
@@ -112,16 +117,11 @@ function otsuThreshold(grayArray) {
       threshold = t;
     }
   }
-
   return threshold;
 }
 
-// Find bounding box of “not-white” pixels (target ink)
 function findBBoxNotWhite(gray, w, h, notWhiteThresh = 235) {
-  let minX = w,
-    minY = h,
-    maxX = -1,
-    maxY = -1;
+  let minX = w, minY = h, maxX = -1, maxY = -1;
 
   for (let i = 0; i < gray.length; i++) {
     if (gray[i] < notWhiteThresh) {
@@ -140,7 +140,6 @@ function findBBoxNotWhite(gray, w, h, notWhiteThresh = 235) {
   return { minX, minY, maxX, maxY, width: bw, height: bh };
 }
 
-// 4-neighbor connected components on a binary mask
 function connectedComponents(mask, w, h, region) {
   const visited = new Uint8Array(w * h);
   const comps = [];
@@ -154,13 +153,8 @@ function connectedComponents(mask, w, h, region) {
       const stack = [i0];
       visited[i0] = 1;
 
-      let area = 0,
-        sumX = 0,
-        sumY = 0;
-      let bx0 = w,
-        by0 = h,
-        bx1 = -1,
-        by1 = -1;
+      let area = 0, sumX = 0, sumY = 0;
+      let bx0 = w, by0 = h, bx1 = -1, by1 = -1;
 
       while (stack.length) {
         const i = stack.pop();
@@ -177,27 +171,12 @@ function connectedComponents(mask, w, h, region) {
         if (ix > bx1) bx1 = ix;
         if (iy > by1) by1 = iy;
 
-        const left = i - 1,
-          right = i + 1,
-          up = i - w,
-          down = i + w;
+        const left = i - 1, right = i + 1, up = i - w, down = i + w;
 
-        if (ix > minX && mask[left] && !visited[left]) {
-          visited[left] = 1;
-          stack.push(left);
-        }
-        if (ix < maxX && mask[right] && !visited[right]) {
-          visited[right] = 1;
-          stack.push(right);
-        }
-        if (iy > minY && mask[up] && !visited[up]) {
-          visited[up] = 1;
-          stack.push(up);
-        }
-        if (iy < maxY && mask[down] && !visited[down]) {
-          visited[down] = 1;
-          stack.push(down);
-        }
+        if (ix > minX && mask[left] && !visited[left]) { visited[left] = 1; stack.push(left); }
+        if (ix < maxX && mask[right] && !visited[right]) { visited[right] = 1; stack.push(right); }
+        if (iy > minY && mask[up] && !visited[up]) { visited[up] = 1; stack.push(up); }
+        if (iy < maxY && mask[down] && !visited[down]) { visited[down] = 1; stack.push(down); }
       }
 
       const bw = bx1 - bx0 + 1;
@@ -205,26 +184,12 @@ function connectedComponents(mask, w, h, region) {
       const fill = area / (bw * bh);
       const aspect = Math.max(bw / bh, bh / bw);
 
-      comps.push({
-        area,
-        cx: sumX / area,
-        cy: sumY / area,
-        bx0,
-        by0,
-        bx1,
-        by1,
-        bw,
-        bh,
-        fill,
-        aspect,
-      });
+      comps.push({ area, cx: sumX / area, cy: sumY / area, bx0, by0, bx1, by1, bw, bh, fill, aspect });
     }
   }
-
   return comps;
 }
 
-// Tightest subset (keep MAX_SHOTS closest to mean)
 function pickTightest(points, kMax) {
   if (points.length <= kMax) return points;
   const mx = points.reduce((a, p) => a + p.cx, 0) / points.length;
@@ -242,10 +207,8 @@ app.post("/api/sec", upload.single("file"), async (req, res) => {
       return res.status(400).json({ ok: false, error: "No image uploaded. Field name must be: file" });
     }
 
-    // Normalize orientation (EXIF)
     const img = sharp(req.file.buffer).rotate();
 
-    // Resize to manageable size for CPU
     const { data, info } = await img
       .resize({ width: MAX_W, withoutEnlargement: true })
       .grayscale()
@@ -255,13 +218,11 @@ app.post("/api/sec", upload.single("file"), async (req, res) => {
     const w = info.width;
     const h = info.height;
 
-    // 1) Find “ink” bbox (target-like region)
     const inkBox = findBBoxNotWhite(data, w, h, 235);
     if (!inkBox) {
       return res.status(422).json({ ok: false, error: "No target-like region detected (too white / too blank)." });
     }
 
-    // Target-likeness gate: bbox covers enough of the image and is roughly square
     const bboxArea = inkBox.width * inkBox.height;
     const imgArea = w * h;
     const areaFrac = bboxArea / imgArea;
@@ -275,7 +236,7 @@ app.post("/api/sec", upload.single("file"), async (req, res) => {
       });
     }
 
-    // 2) Square crop around bbox center (keeps Top=Up, Right=Right)
+    // Square crop
     const padX = Math.round(inkBox.width * INK_PAD_PCT);
     const padY = Math.round(inkBox.height * INK_PAD_PCT);
 
@@ -298,18 +259,37 @@ app.post("/api/sec", upload.single("file"), async (req, res) => {
 
     const region = { minX, minY, maxX, maxY, width: side, height: side };
 
-    // 3) Otsu threshold in the crop region
+    // Region stats (NEW paper/ink gate)
     const regionGray = new Uint8Array(region.width * region.height);
     let k = 0;
+    let whiteCount = 0;
+    let darkCount = 0;
     for (let y = minY; y <= maxY; y++) {
       const row = y * w;
-      for (let x = minX; x <= maxX; x++) regionGray[k++] = data[row + x];
+      for (let x = minX; x <= maxX; x++) {
+        const v = data[row + x];
+        regionGray[k++] = v;
+        if (v >= PAPER_WHITE_THRESH) whiteCount++;
+        if (v <= DARK_THRESH) darkCount++;
+      }
     }
 
+    const totalPix = regionGray.length;
+    const whiteFrac = whiteCount / totalPix;
+    const darkFrac = darkCount / totalPix;
+
+    if (whiteFrac < PAPER_WHITE_FRAC_MIN || darkFrac > DARK_FRAC_MAX) {
+      return res.status(422).json({
+        ok: false,
+        error: "Image rejected: crop does not look like a paper target (background/texture too complex).",
+        debug: { whiteFrac: round2(whiteFrac), darkFrac: round2(darkFrac) },
+      });
+    }
+
+    // Otsu threshold
     let t = otsuThreshold(regionGray);
     t = clamp(t, OTSU_CLAMP_MIN, OTSU_CLAMP_MAX);
 
-    // Build binary mask for dark pixels inside crop region
     const mask = new Uint8Array(w * h);
     for (let y = minY; y <= maxY; y++) {
       const row = y * w;
@@ -319,21 +299,19 @@ app.post("/api/sec", upload.single("file"), async (req, res) => {
       }
     }
 
-    // 4) Connected components + blob filters = “shot-like” candidates
     const comps = connectedComponents(mask, w, h, region);
 
     const targetArea = region.width * region.height;
     const minArea = Math.round(targetArea * MIN_AREA_PCT);
     const maxArea = Math.round(targetArea * MAX_AREA_PCT);
 
-    const margin = Math.max(10, Math.round(region.width * 0.01)); // keep away from crop edges
+    const margin = Math.max(10, Math.round(region.width * 0.01));
 
     const candidates = comps.filter((c) => {
       if (c.area < minArea || c.area > maxArea) return false;
       if (c.aspect > MAX_ASPECT) return false;
       if (c.fill < MIN_FILL) return false;
 
-      // reject blobs on the border (likely frame/border/grid)
       if (c.bx0 <= minX + margin) return false;
       if (c.by0 <= minY + margin) return false;
       if (c.bx1 >= maxX - margin) return false;
@@ -342,7 +320,15 @@ app.post("/api/sec", upload.single("file"), async (req, res) => {
       return true;
     });
 
-    // 5) FAIL CLOSED: if we don’t have a real cluster, do not compute
+    // Noise gate (NEW)
+    if (candidates.length > MAX_CANDIDATES) {
+      return res.status(422).json({
+        ok: false,
+        error: "Image rejected: too many candidate marks (image is noisy / not a clean target photo).",
+        debug: { candidates: candidates.length, threshold: t },
+      });
+    }
+
     if (candidates.length < MIN_SHOTS) {
       return res.status(422).json({
         ok: false,
@@ -353,38 +339,30 @@ app.post("/api/sec", upload.single("file"), async (req, res) => {
 
     const chosen = pickTightest(candidates, MAX_SHOTS);
 
-    // Center of chosen shots (POIB internally)
     const shotCx = chosen.reduce((a, p) => a + p.cx, 0) / chosen.length;
     const shotCy = chosen.reduce((a, p) => a + p.cy, 0) / chosen.length;
 
     const targetCx = minX + region.width / 2;
     const targetCy = minY + region.height / 2;
 
-    // Pixel offset (positive right, positive down)
     const dxPx = shotCx - targetCx;
     const dyPx = shotCy - targetCy;
 
-    // Convert pixels -> inches using known target width
     const inPerPx = TARGET_WIDTH_IN / region.width;
     const dxIn = dxPx * inPerPx;
     const dyIn = dyPx * inPerPx;
 
-    // Inches -> MOA
     const ipm = inchesPerMOA(DISTANCE_YARDS);
     const dxMOA = dxIn / ipm;
     const dyMOA = dyIn / ipm;
 
-    // MOA -> clicks
     const dxClicks = dxMOA / MOA_PER_CLICK;
     const dyClicks = dyMOA / MOA_PER_CLICK;
 
-    // Convention: “Dial to center (move impact to center)”
-    // If impact is right (+dx), dial LEFT (negative windage).
-    // If impact is low (+dy), dial UP (positive elevation).
+    // Dial-to-center convention
     let windageClicks = -dxClicks;
     let elevationClicks = +dyClicks;
 
-    // HARD sanity clamp — fail closed if insane
     if (Math.abs(windageClicks) > MAX_ABS_CLICKS || Math.abs(elevationClicks) > MAX_ABS_CLICKS) {
       return res.status(422).json({
         ok: false,
@@ -398,7 +376,6 @@ app.post("/api/sec", upload.single("file"), async (req, res) => {
       });
     }
 
-    // Return clicks as truth (avoid frontend unit mismatch)
     windageClicks = round2(windageClicks);
     elevationClicks = round2(elevationClicks);
 
@@ -406,11 +383,10 @@ app.post("/api/sec", upload.single("file"), async (req, res) => {
       ok: true,
       units: "CLICKS",
       convention: "DIAL_TO_CENTER",
-      sec: {
-        windage_clicks: windageClicks,
-        elevation_clicks: elevationClicks,
-      },
+      sec: { windage_clicks: windageClicks, elevation_clicks: elevationClicks },
       debug: {
+        whiteFrac: round2(whiteFrac),
+        darkFrac: round2(darkFrac),
         shotsDetected: candidates.length,
         shotsUsed: chosen.length,
         threshold: t,
@@ -423,7 +399,6 @@ app.post("/api/sec", upload.single("file"), async (req, res) => {
   }
 });
 
-// 404
 app.use((req, res) => {
   res.status(404).json({ ok: false, error: `Not found: ${req.method} ${req.path}` });
 });
