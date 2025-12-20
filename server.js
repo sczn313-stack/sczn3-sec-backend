@@ -1,350 +1,425 @@
-/**
- * SCZN3 SEC Backend — server.js (CLEAN)
- *
- * Endpoints:
- * - GET  /            -> plain text up
- * - GET  /api/health  -> minimal health
- * - POST /api/sec     -> multipart/form-data field name: "file"
- *                        returns ONLY: { ok, units, convention, sec:{ windage_clicks, elevation_clicks } }
- *
- * Math:
- * inchesPerClick = 1.047 * MOA_PER_CLICK * (DISTANCE_YARDS / 100)
- * Pixels -> inches uses TARGET_WIDTH_IN / detectedTargetRegionWidthPx
- */
+// server.js (ESM)
 
-const express = require("express");
-const cors = require("cors");
-const multer = require("multer");
-const sharp = require("sharp");
+import express from "express";
+import cors from "cors";
+import multer from "multer";
+import sharp from "sharp";
 
-// ----------------------------
-// Config (env overrides allowed)
-// ----------------------------
-const DISTANCE_YARDS = num(process.env.DISTANCE_YARDS, 100);
-const MOA_PER_CLICK = num(process.env.MOA_PER_CLICK, 0.25);
-const TARGET_WIDTH_IN = num(process.env.TARGET_WIDTH_IN, 23);
-
-const MIN_SHOTS = int(process.env.MIN_SHOTS, 3);
-const MAX_SHOTS = int(process.env.MAX_SHOTS, 7);
-const MAX_ABS_CLICKS = num(process.env.MAX_ABS_CLICKS, 80);
-
-const PAPER_WHITE_THRESH = int(process.env.PAPER_WHITE_THRESH, 230);
-const DARK_THRESH = int(process.env.DARK_THRESH, 80);
-
-const AREA_FRAC_MIN = num(process.env.AREA_FRAC_MIN, 0.60);
-const ASPECT_MIN = num(process.env.ASPECT_MIN, 0.85);
-const ASPECT_MAX = num(process.env.ASPECT_MAX, 1.15);
-
-const MAX_PROCESS_W = int(process.env.MAX_PROCESS_W, 1100);
-const PORT = int(process.env.PORT, 10000);
-
-// ----------------------------
-// App + middleware
-// ----------------------------
 const app = express();
 app.use(cors());
-app.use(express.json({ limit: "1mb" }));
 
 const upload = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: 8 * 1024 * 1024 }, // 8MB
+  limits: { fileSize: 12 * 1024 * 1024 }, // 12MB
 });
 
-// ----------------------------
-// Helpers
-// ----------------------------
-function num(v, d) {
-  const n = parseFloat(v);
-  return Number.isFinite(n) ? n : d;
+function numEnv(name, fallback) {
+  const v = process.env[name];
+  if (v === undefined || v === null || String(v).trim() === "") return fallback;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : fallback;
 }
-function int(v, d) {
-  const n = parseInt(v, 10);
-  return Number.isFinite(n) ? n : d;
+
+const CONFIG = {
+  DISTANCE_YARDS: numEnv("DISTANCE_YARDS", 100),
+  MOA_PER_CLICK: numEnv("MOA_PER_CLICK", 0.25), // quarter MOA default
+  TARGET_WIDTH_IN: numEnv("TARGET_WIDTH_IN", 23),
+
+  MIN_SHOTS: Math.round(numEnv("MIN_SHOTS", 3)),
+  MAX_SHOTS: Math.round(numEnv("MAX_SHOTS", 7)),
+  MAX_ABS_CLICKS: numEnv("MAX_ABS_CLICKS", 80),
+
+  PAPER_WHITE_THRESH: Math.round(numEnv("PAPER_WHITE_THRESH", 230)), // 0..255
+  PAPER_WHITE_FRAC_MIN: numEnv("PAPER_WHITE_FRAC_MIN", 0.28),
+
+  DARK_THRESH: Math.round(numEnv("DARK_THRESH", 80)), // 0..255
+  DARK_FRAC_MAX: numEnv("DARK_FRAC_MAX", 0.25),
+
+  CLUSTER_RADIUS_IN: numEnv("CLUSTER_RADIUS_IN", 8), // cluster radius in inches
+};
+
+function clampAbs(x, absMax) {
+  if (!Number.isFinite(x)) return 0;
+  if (x > absMax) return absMax;
+  if (x < -absMax) return -absMax;
+  return x;
 }
-function clamp(v, lo, hi) {
-  return Math.max(lo, Math.min(hi, v));
-}
+
 function round2(x) {
   return Math.round(x * 100) / 100;
 }
+
 function inchesPerClick(distanceYards, moaPerClick) {
-  // 1 MOA ~= 1.047" at 100 yards
+  // 1 MOA ≈ 1.047" at 100 yards
   return 1.047 * moaPerClick * (distanceYards / 100);
 }
-function isWhite(r, g, b) {
-  return r >= PAPER_WHITE_THRESH && g >= PAPER_WHITE_THRESH && b >= PAPER_WHITE_THRESH;
-}
-function isDark(r, g, b) {
-  return r <= DARK_THRESH && g <= DARK_THRESH && b <= DARK_THRESH;
-}
 
-async function loadRGBA(buffer) {
-  let img = sharp(buffer, { failOnError: false }).rotate(); // respect EXIF
-  const meta = await img.metadata();
-  const w0 = meta.width || 0;
-  const h0 = meta.height || 0;
-  if (!w0 || !h0) throw new Error("Could not read image dimensions.");
+async function decodeGrayscale(buffer) {
+  const { data, info } = await sharp(buffer)
+    .rotate()
+    .ensureAlpha()
+    .raw()
+    .toBuffer({ resolveWithObject: true });
 
-  if (w0 > MAX_PROCESS_W) {
-    img = img.resize({ width: MAX_PROCESS_W, withoutEnlargement: true });
+  const w = info.width;
+  const h = info.height;
+
+  // Convert RGBA -> grayscale 0..255
+  const gray = new Uint8Array(w * h);
+  for (let i = 0, p = 0; i < gray.length; i++, p += 4) {
+    const r = data[p];
+    const g = data[p + 1];
+    const b = data[p + 2];
+    // luminance
+    gray[i] = Math.round(0.2126 * r + 0.7152 * g + 0.0722 * b);
   }
 
-  const outMeta = await img.metadata();
-  const w = outMeta.width;
-  const h = outMeta.height;
-
-  const data = await img.ensureAlpha().raw().toBuffer(); // RGBA
-  return { data: new Uint8Array(data), w, h };
+  return { gray, width: w, height: h };
 }
 
-function findNonWhiteBBox(rgba, w, h) {
-  let minX = w, minY = h, maxX = -1, maxY = -1;
+function rowWhiteFrac(gray, w, y, whiteThresh) {
+  let white = 0;
+  const base = y * w;
+  for (let x = 0; x < w; x++) {
+    if (gray[base + x] >= whiteThresh) white++;
+  }
+  return white / w;
+}
 
+function colWhiteFrac(gray, w, h, x, whiteThresh) {
+  let white = 0;
   for (let y = 0; y < h; y++) {
-    let row = y * w * 4;
-    for (let x = 0; x < w; x++) {
-      const i = row + x * 4;
-      const r = rgba[i], g = rgba[i + 1], b = rgba[i + 2];
-      if (!isWhite(r, g, b)) {
-        if (x < minX) minX = x;
-        if (y < minY) minY = y;
-        if (x > maxX) maxX = x;
-        if (y > maxY) maxY = y;
-      }
-    }
+    if (gray[y * w + x] >= whiteThresh) white++;
   }
-
-  if (maxX < 0 || maxY < 0) return null;
-
-  const width = maxX - minX + 1;
-  const height = maxY - minY + 1;
-  const areaFrac = (width * height) / (w * h);
-  const aspect = width / height;
-
-  return { x0: minX, y0: minY, x1: maxX, y1: maxY, width, height, areaFrac, aspect };
+  return white / h;
 }
 
-function findDarkBlobs(rgba, w, h, bbox) {
-  const { x0, y0, x1, y1 } = bbox;
-  const bw = x1 - x0 + 1;
-  const bh = y1 - y0 + 1;
+function findPaperBounds(gray, w, h) {
+  const wt = CONFIG.PAPER_WHITE_THRESH;
+  const minFrac = CONFIG.PAPER_WHITE_FRAC_MIN;
 
-  const mask = new Uint8Array(bw * bh);
-
-  for (let y = 0; y < bh; y++) {
-    const yy = y0 + y;
-    let row = (yy * w + x0) * 4;
-    for (let x = 0; x < bw; x++) {
-      const i = row + x * 4;
-      const r = rgba[i], g = rgba[i + 1], b = rgba[i + 2];
-      const idx = y * bw + x;
-      if (isDark(r, g, b)) mask[idx] = 1;
+  let top = 0;
+  for (let y = 0; y < h; y++) {
+    if (rowWhiteFrac(gray, w, y, wt) >= minFrac) {
+      top = y;
+      break;
     }
   }
 
-  const visited = new Uint8Array(bw * bh);
-  const blobs = [];
-  const stack = [];
-
-  const minArea = 12;     // reject tiny noise
-  const maxArea = 20000;  // reject huge fills
-
-  for (let y = 0; y < bh; y++) {
-    for (let x = 0; x < bw; x++) {
-      const idx = y * bw + x;
-      if (!mask[idx] || visited[idx]) continue;
-
-      visited[idx] = 1;
-      stack.push(idx);
-
-      let area = 0;
-      let sumX = 0;
-      let sumY = 0;
-
-      while (stack.length) {
-        const cur = stack.pop();
-        const cy = Math.floor(cur / bw);
-        const cx = cur - cy * bw;
-
-        area++;
-        sumX += cx;
-        sumY += cy;
-
-        if (cx > 0) {
-          const n = cur - 1;
-          if (mask[n] && !visited[n]) {
-            visited[n] = 1;
-            stack.push(n);
-          }
-        }
-        if (cx + 1 < bw) {
-          const n = cur + 1;
-          if (mask[n] && !visited[n]) {
-            visited[n] = 1;
-            stack.push(n);
-          }
-        }
-        if (cy > 0) {
-          const n = cur - bw;
-          if (mask[n] && !visited[n]) {
-            visited[n] = 1;
-            stack.push(n);
-          }
-        }
-        if (cy + 1 < bh) {
-          const n = cur + bw;
-          if (mask[n] && !visited[n]) {
-            visited[n] = 1;
-            stack.push(n);
-          }
-        }
-      }
-
-      if (area >= minArea && area <= maxArea) {
-        blobs.push({
-          area,
-          cx: x0 + (sumX / area),
-          cy: y0 + (sumY / area),
-        });
-      }
+  let bottom = h - 1;
+  for (let y = h - 1; y >= 0; y--) {
+    if (rowWhiteFrac(gray, w, y, wt) >= minFrac) {
+      bottom = y;
+      break;
     }
   }
 
-  return blobs;
+  let left = 0;
+  for (let x = 0; x < w; x++) {
+    if (colWhiteFrac(gray, w, h, x, wt) >= minFrac) {
+      left = x;
+      break;
+    }
+  }
+
+  let right = w - 1;
+  for (let x = w - 1; x >= 0; x--) {
+    if (colWhiteFrac(gray, w, h, x, wt) >= minFrac) {
+      right = x;
+      break;
+    }
+  }
+
+  // Sanity
+  const rw = Math.max(1, right - left + 1);
+  const rh = Math.max(1, bottom - top + 1);
+  return { left, top, width: rw, height: rh };
 }
 
-async function computeSEC(buffer, opts) {
-  const convention = String(opts.convention || "DIAL_TO_CENTER").toUpperCase();
-  const distanceYards = num(opts.distanceYards, DISTANCE_YARDS);
-  const moaPerClick = num(opts.moaPerClick, MOA_PER_CLICK);
-  const targetWidthIn = num(opts.targetWidthIn, TARGET_WIDTH_IN);
+function regionStats(gray, w, region) {
+  const { left, top, width, height } = region;
+  const total = width * height;
 
-  const { data, w, h } = await loadRGBA(buffer);
-  const bbox = findNonWhiteBBox(data, w, h);
+  let white = 0;
+  let dark = 0;
 
-  if (!bbox) {
-    const e = new Error("Image rejected: does not look like a full target in-frame.");
-    e.status = 422;
-    throw e;
+  for (let y = 0; y < height; y++) {
+    const yy = top + y;
+    const base = yy * w + left;
+    for (let x = 0; x < width; x++) {
+      const v = gray[base + x];
+      if (v >= CONFIG.PAPER_WHITE_THRESH) white++;
+      if (v <= CONFIG.DARK_THRESH) dark++;
+    }
   }
-
-  if (bbox.areaFrac < AREA_FRAC_MIN || bbox.aspect < ASPECT_MIN || bbox.aspect > ASPECT_MAX) {
-    const e = new Error("Image rejected: does not look like a full target in-frame.");
-    e.status = 422;
-    throw e;
-  }
-
-  const blobs = findDarkBlobs(data, w, h, bbox);
-  blobs.sort((a, b) => b.area - a.area);
-
-  if (blobs.length < MIN_SHOTS) {
-    const e = new Error(`Image rejected: not enough shots detected (${blobs.length}).`);
-    e.status = 422;
-    throw e;
-  }
-
-  const used = blobs.slice(0, MAX_SHOTS);
-
-  let shotCx = 0;
-  let shotCy = 0;
-  for (const s of used) {
-    shotCx += s.cx;
-    shotCy += s.cy;
-  }
-  shotCx /= used.length;
-  shotCy /= used.length;
-
-  const targetCx = bbox.x0 + bbox.width / 2;
-  const targetCy = bbox.y0 + bbox.height / 2;
-
-  const dxPx = shotCx - targetCx;
-  const dyPx = shotCy - targetCy;
-
-  const inPerPx = targetWidthIn / bbox.width;
-  const dxIn = dxPx * inPerPx;
-  const dyIn = dyPx * inPerPx;
-
-  const ipc = inchesPerClick(distanceYards, moaPerClick);
-
-  // Convention defaults to DIAL_TO_CENTER:
-  // dxIn > 0 (impact right) -> dial left (negative wind)
-  // dyIn < 0 (impact high)  -> dial down (negative elev)
-  let windClicks = 0;
-  let elevClicks = 0;
-
-  if (convention === "DIAL_TO_GROUP") {
-    windClicks = dxIn / ipc;
-    elevClicks = dyIn / ipc;
-  } else {
-    windClicks = -dxIn / ipc;
-    elevClicks = dyIn / ipc;
-  }
-
-  windClicks = clamp(windClicks, -MAX_ABS_CLICKS, MAX_ABS_CLICKS);
-  elevClicks = clamp(elevClicks, -MAX_ABS_CLICKS, MAX_ABS_CLICKS);
 
   return {
-    units: "CLICKS",
-    convention,
-    sec: {
-      windage_clicks: round2(windClicks),
-      elevation_clicks: round2(elevClicks),
-    },
+    whiteFrac: white / total,
+    darkFrac: dark / total,
   };
 }
 
-// ----------------------------
-// Routes
-// ----------------------------
+function detectShots(gray, w, region) {
+  const { left, top, width, height } = region;
+
+  // Build a downsampled dark-pixel grid
+  const step = Math.max(1, Math.floor(Math.max(width, height) / 800));
+  const gw = Math.max(1, Math.floor(width / step));
+  const gh = Math.max(1, Math.floor(height / step));
+
+  const dark = new Uint8Array(gw * gh);
+  for (let gy = 0; gy < gh; gy++) {
+    for (let gx = 0; gx < gw; gx++) {
+      const px = left + Math.min(width - 1, gx * step + Math.floor(step / 2));
+      const py = top + Math.min(height - 1, gy * step + Math.floor(step / 2));
+      const v = gray[py * w + px];
+      dark[gy * gw + gx] = v <= CONFIG.DARK_THRESH ? 1 : 0;
+    }
+  }
+
+  // Connected components on the grid
+  const seen = new Uint8Array(gw * gh);
+  const points = [];
+
+  const dirs = [
+    [1, 0],
+    [-1, 0],
+    [0, 1],
+    [0, -1],
+    [1, 1],
+    [1, -1],
+    [-1, 1],
+    [-1, -1],
+  ];
+
+  for (let i = 0; i < dark.length; i++) {
+    if (!dark[i] || seen[i]) continue;
+
+    // BFS
+    const q = [i];
+    seen[i] = 1;
+
+    let count = 0;
+    let sumX = 0;
+    let sumY = 0;
+
+    while (q.length) {
+      const idx = q.pop();
+      const y = Math.floor(idx / gw);
+      const x = idx - y * gw;
+
+      count++;
+      sumX += x;
+      sumY += y;
+
+      for (const [dx, dy] of dirs) {
+        const nx = x + dx;
+        const ny = y + dy;
+        if (nx < 0 || ny < 0 || nx >= gw || ny >= gh) continue;
+        const nidx = ny * gw + nx;
+        if (seen[nidx] || !dark[nidx]) continue;
+        seen[nidx] = 1;
+        q.push(nidx);
+      }
+    }
+
+    // Filter blob sizes (in grid-cells)
+    // These are intentionally broad because phone photos vary a lot.
+    if (count < 3) continue;
+    if (count > 4000) continue;
+
+    const cx = sumX / count;
+    const cy = sumY / count;
+
+    // Convert back to original pixel coords (center of the component in region space)
+    const px = left + cx * step;
+    const py = top + cy * step;
+
+    points.push({ x: px, y: py, size: count });
+  }
+
+  return points;
+}
+
+function pickCluster(points, region) {
+  if (points.length === 0) return { used: [], center: null };
+
+  // Prefer larger blobs first (helps ignore tiny noise)
+  const pts = [...points].sort((a, b) => b.size - a.size).slice(0, 200);
+
+  const radiusPx = (CONFIG.CLUSTER_RADIUS_IN / CONFIG.TARGET_WIDTH_IN) * region.width;
+
+  // Find densest point by neighbor count within radius
+  let bestIdx = 0;
+  let bestCount = -1;
+
+  for (let i = 0; i < pts.length; i++) {
+    let c = 0;
+    for (let j = 0; j < pts.length; j++) {
+      const dx = pts[j].x - pts[i].x;
+      const dy = pts[j].y - pts[i].y;
+      if (dx * dx + dy * dy <= radiusPx * radiusPx) c++;
+    }
+    if (c > bestCount) {
+      bestCount = c;
+      bestIdx = i;
+    }
+  }
+
+  const seed = pts[bestIdx];
+
+  // Collect cluster points around seed
+  const cluster = pts
+    .map((p) => {
+      const dx = p.x - seed.x;
+      const dy = p.y - seed.y;
+      const d2 = dx * dx + dy * dy;
+      return { ...p, d2 };
+    })
+    .filter((p) => p.d2 <= radiusPx * radiusPx)
+    .sort((a, b) => a.d2 - b.d2)
+    .slice(0, CONFIG.MAX_SHOTS);
+
+  if (cluster.length < CONFIG.MIN_SHOTS) return { used: [], center: null };
+
+  // Cluster center
+  let sx = 0,
+    sy = 0;
+  for (const p of cluster) {
+    sx += p.x;
+    sy += p.y;
+  }
+  const center = { x: sx / cluster.length, y: sy / cluster.length };
+
+  return { used: cluster, center };
+}
+
+function computeSEC({ shotCenterPx, region }) {
+  const targetCx = region.left + region.width / 2;
+  const targetCy = region.top + region.height / 2;
+
+  const dxPx = shotCenterPx.x - targetCx;
+  const dyPx = shotCenterPx.y - targetCy;
+
+  const inPerPx = CONFIG.TARGET_WIDTH_IN / region.width;
+
+  const dxIn = dxPx * inPerPx;
+  const dyIn = dyPx * inPerPx;
+
+  const ipc = inchesPerClick(CONFIG.DISTANCE_YARDS, CONFIG.MOA_PER_CLICK);
+
+  // Convention: DIAL_TO_CENTER (move impact to center)
+  // +dxIn => impacts RIGHT => dial LEFT => negative clicks => invert windage
+  // +dyIn => impacts LOW (down) => dial UP? (depends on scope convention)
+  // Your UI arrows currently match keeping elevation sign as dyIn.
+  const windage = clampAbs(-dxIn / ipc, CONFIG.MAX_ABS_CLICKS);
+  const elevation = clampAbs(dyIn / ipc, CONFIG.MAX_ABS_CLICKS);
+
+  return {
+    dxPx,
+    dyPx,
+    dxIn,
+    dyIn,
+    windage_clicks: round2(windage),
+    elevation_clicks: round2(elevation),
+  };
+}
+
 app.get("/", (_req, res) => {
-  res.type("text/plain").send("SCZN3 SEC Backend is up");
+  res.type("text/plain").send("up");
 });
 
 app.get("/api/health", (_req, res) => {
-  res.json({ ok: true });
+  res.json({
+    ok: true,
+    routes: ["GET /", "GET /api/health", "POST /api/sec"],
+    config: {
+      DISTANCE_YARDS: CONFIG.DISTANCE_YARDS,
+      MOA_PER_CLICK: CONFIG.MOA_PER_CLICK,
+      TARGET_WIDTH_IN: CONFIG.TARGET_WIDTH_IN,
+      MIN_SHOTS: CONFIG.MIN_SHOTS,
+      MAX_SHOTS: CONFIG.MAX_SHOTS,
+      MAX_ABS_CLICKS: CONFIG.MAX_ABS_CLICKS,
+      PAPER_WHITE_THRESH: CONFIG.PAPER_WHITE_THRESH,
+      PAPER_WHITE_FRAC_MIN: CONFIG.PAPER_WHITE_FRAC_MIN,
+      DARK_THRESH: CONFIG.DARK_THRESH,
+      DARK_FRAC_MAX: CONFIG.DARK_FRAC_MAX,
+      CLUSTER_RADIUS_IN: CONFIG.CLUSTER_RADIUS_IN,
+    },
+  });
 });
 
 app.post("/api/sec", upload.single("file"), async (req, res) => {
   try {
     if (!req.file || !req.file.buffer) {
-      return res.status(400).json({
+      return res.status(400).json({ ok: false, error: 'No image uploaded. Field name must be: "file"' });
+    }
+
+    const { gray, width: w, height: h } = await decodeGrayscale(req.file.buffer);
+
+    const region = findPaperBounds(gray, w, h);
+    const areaFrac = (region.width * region.height) / (w * h);
+    const aspect = region.width / region.height;
+
+    // Basic “full target in-frame” checks
+    if (areaFrac < 0.6 || aspect < 0.75 || aspect > 1.33) {
+      return res.status(422).json({
         ok: false,
-        error: "No image uploaded. Field name must be: file",
+        error: "Image rejected: does not look like a full target in-frame.",
+        debug: { areaFrac: round2(areaFrac), aspect: round2(aspect) },
       });
     }
 
-    const convention = req.body?.convention || req.query?.convention || "DIAL_TO_CENTER";
-    const distanceYards =
-      req.body?.distanceYards || req.body?.distance_yards || req.query?.distanceYards || req.query?.distance_yards;
-    const moaPerClick =
-      req.body?.moaPerClick || req.body?.moa_per_click || req.query?.moaPerClick || req.query?.moa_per_click;
-    const targetWidthIn =
-      req.body?.targetWidthIn || req.body?.target_width_in || req.query?.targetWidthIn || req.query?.target_width_in;
+    const stats = regionStats(gray, w, region);
+    if (stats.darkFrac > CONFIG.DARK_FRAC_MAX) {
+      return res.status(422).json({
+        ok: false,
+        error: "Image rejected: too much dark area (likely not a paper target).",
+        debug: { darkFrac: round2(stats.darkFrac), whiteFrac: round2(stats.whiteFrac) },
+      });
+    }
 
-    const out = await computeSEC(req.file.buffer, {
-      convention,
-      distanceYards,
-      moaPerClick,
-      targetWidthIn,
-    });
+    const candidates = detectShots(gray, w, region);
+    const cluster = pickCluster(candidates, region);
 
-    res.json({
+    if (!cluster.center) {
+      return res.status(422).json({
+        ok: false,
+        error: `Image rejected: not enough shots detected (${cluster.used.length}).`,
+        debug: { shotsDetected: candidates.length, shotsUsed: cluster.used.length },
+      });
+    }
+
+    const sec = computeSEC({ shotCenterPx: cluster.center, region });
+
+    return res.json({
       ok: true,
-      units: out.units,
-      convention: out.convention,
-      sec: out.sec,
+      units: "CLICKS",
+      convention: "DIAL_TO_CENTER",
+      sec: {
+        windage_clicks: sec.windage_clicks,
+        elevation_clicks: sec.elevation_clicks,
+      },
+      // dev-only helpers (your UI can ignore these; Hoppscotch can show them)
+      debug: {
+        whiteFrac: round2(stats.whiteFrac),
+        darkFrac: round2(stats.darkFrac),
+        shotsDetected: candidates.length,
+        shotsUsed: cluster.used.length,
+        dxPx: round2(sec.dxPx),
+        dyPx: round2(sec.dyPx),
+      },
     });
   } catch (err) {
-    res.status(err.status || 500).json({
+    return res.status(500).json({
       ok: false,
-      error: err.message || "Server error",
+      error: "Server error processing image.",
+      debug: { message: err?.message || String(err) },
     });
   }
 });
 
-// ----------------------------
-// Start
-// ----------------------------
+const PORT = Number(process.env.PORT) || 10000;
 app.listen(PORT, () => {
-  console.log(`SCZN3 SEC backend listening on :${PORT}`);
+  console.log(`SCZN3 SEC backend listening on ${PORT}`);
 });
