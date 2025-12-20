@@ -1,5 +1,3 @@
-// server.js (ESM)
-
 import express from "express";
 import cors from "cors";
 import multer from "multer";
@@ -10,7 +8,7 @@ app.use(cors());
 
 const upload = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: 12 * 1024 * 1024 }, // 12MB
+  limits: { fileSize: 12 * 1024 * 1024 },
 });
 
 function numEnv(name, fallback) {
@@ -22,20 +20,20 @@ function numEnv(name, fallback) {
 
 const CONFIG = {
   DISTANCE_YARDS: numEnv("DISTANCE_YARDS", 100),
-  MOA_PER_CLICK: numEnv("MOA_PER_CLICK", 0.25), // quarter MOA default
+  MOA_PER_CLICK: numEnv("MOA_PER_CLICK", 0.25),
   TARGET_WIDTH_IN: numEnv("TARGET_WIDTH_IN", 23),
 
   MIN_SHOTS: Math.round(numEnv("MIN_SHOTS", 3)),
   MAX_SHOTS: Math.round(numEnv("MAX_SHOTS", 7)),
   MAX_ABS_CLICKS: numEnv("MAX_ABS_CLICKS", 80),
 
-  PAPER_WHITE_THRESH: Math.round(numEnv("PAPER_WHITE_THRESH", 230)), // 0..255
+  PAPER_WHITE_THRESH: Math.round(numEnv("PAPER_WHITE_THRESH", 230)),
   PAPER_WHITE_FRAC_MIN: numEnv("PAPER_WHITE_FRAC_MIN", 0.28),
 
-  DARK_THRESH: Math.round(numEnv("DARK_THRESH", 80)), // 0..255
+  DARK_THRESH: Math.round(numEnv("DARK_THRESH", 80)),
   DARK_FRAC_MAX: numEnv("DARK_FRAC_MAX", 0.25),
 
-  CLUSTER_RADIUS_IN: numEnv("CLUSTER_RADIUS_IN", 8), // cluster radius in inches
+  CLUSTER_RADIUS_IN: numEnv("CLUSTER_RADIUS_IN", 8),
 };
 
 function clampAbs(x, absMax) {
@@ -44,13 +42,10 @@ function clampAbs(x, absMax) {
   if (x < -absMax) return -absMax;
   return x;
 }
-
 function round2(x) {
   return Math.round(x * 100) / 100;
 }
-
 function inchesPerClick(distanceYards, moaPerClick) {
-  // 1 MOA ≈ 1.047" at 100 yards
   return 1.047 * moaPerClick * (distanceYards / 100);
 }
 
@@ -64,16 +59,13 @@ async function decodeGrayscale(buffer) {
   const w = info.width;
   const h = info.height;
 
-  // Convert RGBA -> grayscale 0..255
   const gray = new Uint8Array(w * h);
   for (let i = 0, p = 0; i < gray.length; i++, p += 4) {
     const r = data[p];
     const g = data[p + 1];
     const b = data[p + 2];
-    // luminance
     gray[i] = Math.round(0.2126 * r + 0.7152 * g + 0.0722 * b);
   }
-
   return { gray, width: w, height: h };
 }
 
@@ -130,7 +122,6 @@ function findPaperBounds(gray, w, h) {
     }
   }
 
-  // Sanity
   const rw = Math.max(1, right - left + 1);
   const rh = Math.max(1, bottom - top + 1);
   return { left, top, width: rw, height: rh };
@@ -153,16 +144,12 @@ function regionStats(gray, w, region) {
     }
   }
 
-  return {
-    whiteFrac: white / total,
-    darkFrac: dark / total,
-  };
+  return { whiteFrac: white / total, darkFrac: dark / total };
 }
 
 function detectShots(gray, w, region) {
   const { left, top, width, height } = region;
 
-  // Build a downsampled dark-pixel grid
   const step = Math.max(1, Math.floor(Math.max(width, height) / 800));
   const gw = Math.max(1, Math.floor(width / step));
   const gh = Math.max(1, Math.floor(height / step));
@@ -177,25 +164,17 @@ function detectShots(gray, w, region) {
     }
   }
 
-  // Connected components on the grid
   const seen = new Uint8Array(gw * gh);
   const points = [];
 
   const dirs = [
-    [1, 0],
-    [-1, 0],
-    [0, 1],
-    [0, -1],
-    [1, 1],
-    [1, -1],
-    [-1, 1],
-    [-1, -1],
+    [1, 0],[ -1, 0],[0, 1],[0, -1],
+    [1, 1],[1, -1],[-1, 1],[-1, -1],
   ];
 
   for (let i = 0; i < dark.length; i++) {
     if (!dark[i] || seen[i]) continue;
 
-    // BFS
     const q = [i];
     seen[i] = 1;
 
@@ -223,15 +202,12 @@ function detectShots(gray, w, region) {
       }
     }
 
-    // Filter blob sizes (in grid-cells)
-    // These are intentionally broad because phone photos vary a lot.
     if (count < 3) continue;
     if (count > 4000) continue;
 
     const cx = sumX / count;
     const cy = sumY / count;
 
-    // Convert back to original pixel coords (center of the component in region space)
     const px = left + cx * step;
     const py = top + cy * step;
 
@@ -244,12 +220,11 @@ function detectShots(gray, w, region) {
 function pickCluster(points, region) {
   if (points.length === 0) return { used: [], center: null };
 
-  // Prefer larger blobs first (helps ignore tiny noise)
   const pts = [...points].sort((a, b) => b.size - a.size).slice(0, 200);
 
-  const radiusPx = (CONFIG.CLUSTER_RADIUS_IN / CONFIG.TARGET_WIDTH_IN) * region.width;
+  const scalePx = (region.width + region.height) / 2;
+  const radiusPx = (CONFIG.CLUSTER_RADIUS_IN / CONFIG.TARGET_WIDTH_IN) * scalePx;
 
-  // Find densest point by neighbor count within radius
   let bestIdx = 0;
   let bestCount = -1;
 
@@ -268,13 +243,11 @@ function pickCluster(points, region) {
 
   const seed = pts[bestIdx];
 
-  // Collect cluster points around seed
   const cluster = pts
     .map((p) => {
       const dx = p.x - seed.x;
       const dy = p.y - seed.y;
-      const d2 = dx * dx + dy * dy;
-      return { ...p, d2 };
+      return { ...p, d2: dx * dx + dy * dy };
     })
     .filter((p) => p.d2 <= radiusPx * radiusPx)
     .sort((a, b) => a.d2 - b.d2)
@@ -282,16 +255,12 @@ function pickCluster(points, region) {
 
   if (cluster.length < CONFIG.MIN_SHOTS) return { used: [], center: null };
 
-  // Cluster center
-  let sx = 0,
-    sy = 0;
+  let sx = 0, sy = 0;
   for (const p of cluster) {
     sx += p.x;
     sy += p.y;
   }
-  const center = { x: sx / cluster.length, y: sy / cluster.length };
-
-  return { used: cluster, center };
+  return { used: cluster, center: { x: sx / cluster.length, y: sy / cluster.length } };
 }
 
 function computeSEC({ shotCenterPx, region }) {
@@ -301,33 +270,26 @@ function computeSEC({ shotCenterPx, region }) {
   const dxPx = shotCenterPx.x - targetCx;
   const dyPx = shotCenterPx.y - targetCy;
 
-  const inPerPx = CONFIG.TARGET_WIDTH_IN / region.width;
+  // FIX: square-normalized scale (reduces over/under scaling from imperfect bounds)
+  const scalePx = (region.width + region.height) / 2;
+  const inPerPx = CONFIG.TARGET_WIDTH_IN / scalePx;
 
   const dxIn = dxPx * inPerPx;
   const dyIn = dyPx * inPerPx;
 
   const ipc = inchesPerClick(CONFIG.DISTANCE_YARDS, CONFIG.MOA_PER_CLICK);
 
-  // Convention: DIAL_TO_CENTER (move impact to center)
-  // +dxIn => impacts RIGHT => dial LEFT => negative clicks => invert windage
-  // +dyIn => impacts LOW (down) => dial UP? (depends on scope convention)
-  // Your UI arrows currently match keeping elevation sign as dyIn.
+  // Convention: DIAL_TO_CENTER
   const windage = clampAbs(-dxIn / ipc, CONFIG.MAX_ABS_CLICKS);
   const elevation = clampAbs(dyIn / ipc, CONFIG.MAX_ABS_CLICKS);
 
   return {
-    dxPx,
-    dyPx,
-    dxIn,
-    dyIn,
     windage_clicks: round2(windage),
     elevation_clicks: round2(elevation),
   };
 }
 
-app.get("/", (_req, res) => {
-  res.type("text/plain").send("up");
-});
+app.get("/", (_req, res) => res.type("text/plain").send("up"));
 
 app.get("/api/health", (_req, res) => {
   res.json({
@@ -340,54 +302,36 @@ app.get("/api/health", (_req, res) => {
       MIN_SHOTS: CONFIG.MIN_SHOTS,
       MAX_SHOTS: CONFIG.MAX_SHOTS,
       MAX_ABS_CLICKS: CONFIG.MAX_ABS_CLICKS,
-      PAPER_WHITE_THRESH: CONFIG.PAPER_WHITE_THRESH,
-      PAPER_WHITE_FRAC_MIN: CONFIG.PAPER_WHITE_FRAC_MIN,
-      DARK_THRESH: CONFIG.DARK_THRESH,
-      DARK_FRAC_MAX: CONFIG.DARK_FRAC_MAX,
-      CLUSTER_RADIUS_IN: CONFIG.CLUSTER_RADIUS_IN,
     },
   });
 });
 
 app.post("/api/sec", upload.single("file"), async (req, res) => {
   try {
-    if (!req.file || !req.file.buffer) {
+    if (!req.file?.buffer) {
       return res.status(400).json({ ok: false, error: 'No image uploaded. Field name must be: "file"' });
     }
 
     const { gray, width: w, height: h } = await decodeGrayscale(req.file.buffer);
-
     const region = findPaperBounds(gray, w, h);
+
     const areaFrac = (region.width * region.height) / (w * h);
     const aspect = region.width / region.height;
 
-    // Basic “full target in-frame” checks
     if (areaFrac < 0.6 || aspect < 0.75 || aspect > 1.33) {
-      return res.status(422).json({
-        ok: false,
-        error: "Image rejected: does not look like a full target in-frame.",
-        debug: { areaFrac: round2(areaFrac), aspect: round2(aspect) },
-      });
+      return res.status(422).json({ ok: false, error: "Image rejected: does not look like a full target in-frame." });
     }
 
     const stats = regionStats(gray, w, region);
     if (stats.darkFrac > CONFIG.DARK_FRAC_MAX) {
-      return res.status(422).json({
-        ok: false,
-        error: "Image rejected: too much dark area (likely not a paper target).",
-        debug: { darkFrac: round2(stats.darkFrac), whiteFrac: round2(stats.whiteFrac) },
-      });
+      return res.status(422).json({ ok: false, error: "Image rejected: too much dark area (likely not a paper target)." });
     }
 
     const candidates = detectShots(gray, w, region);
     const cluster = pickCluster(candidates, region);
 
     if (!cluster.center) {
-      return res.status(422).json({
-        ok: false,
-        error: `Image rejected: not enough shots detected (${cluster.used.length}).`,
-        debug: { shotsDetected: candidates.length, shotsUsed: cluster.used.length },
-      });
+      return res.status(422).json({ ok: false, error: "Image rejected: not enough shots detected." });
     }
 
     const sec = computeSEC({ shotCenterPx: cluster.center, region });
@@ -400,26 +344,11 @@ app.post("/api/sec", upload.single("file"), async (req, res) => {
         windage_clicks: sec.windage_clicks,
         elevation_clicks: sec.elevation_clicks,
       },
-      // dev-only helpers (your UI can ignore these; Hoppscotch can show them)
-      debug: {
-        whiteFrac: round2(stats.whiteFrac),
-        darkFrac: round2(stats.darkFrac),
-        shotsDetected: candidates.length,
-        shotsUsed: cluster.used.length,
-        dxPx: round2(sec.dxPx),
-        dyPx: round2(sec.dyPx),
-      },
     });
   } catch (err) {
-    return res.status(500).json({
-      ok: false,
-      error: "Server error processing image.",
-      debug: { message: err?.message || String(err) },
-    });
+    return res.status(500).json({ ok: false, error: "Server error processing image." });
   }
 });
 
 const PORT = Number(process.env.PORT) || 10000;
-app.listen(PORT, () => {
-  console.log(`SCZN3 SEC backend listening on ${PORT}`);
-});
+app.listen(PORT, () => console.log(`SEC backend listening on ${PORT}`));
