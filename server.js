@@ -1,135 +1,111 @@
-/* ============================================================================
-SCZN3 SEC Backend — server.js (FULL FILE)
-- GET /          -> "SCZN3 SEC Backend is up"
-- GET /healthz   -> { ok: true }
-- POST /api/sec  -> multipart/form-data (field name must be: file)
-
-Key fix vs common bug:
-- Uses separate X/Y scaling (inPerPxX, inPerPxY) so elevation isn’t distorted when
-  the detected region isn’t perfectly square.
-
-Defaults (normalized):
-- distanceYards = 100
-- moaPerClick   = 0.25
-============================================================================ */
-
-"use strict";
+/**
+ * SCZN3 SEC Backend — server.js (CLEAN)
+ *
+ * Endpoints:
+ * - GET  /            -> plain text up
+ * - GET  /api/health  -> minimal health
+ * - POST /api/sec     -> multipart/form-data field name: "file"
+ *                        returns ONLY: { ok, units, convention, sec:{ windage_clicks, elevation_clicks } }
+ *
+ * Math:
+ * inchesPerClick = 1.047 * MOA_PER_CLICK * (DISTANCE_YARDS / 100)
+ * Pixels -> inches uses TARGET_WIDTH_IN / detectedTargetRegionWidthPx
+ */
 
 const express = require("express");
 const cors = require("cors");
 const multer = require("multer");
+const sharp = require("sharp");
 
-let sharp = null;
-try {
-  sharp = require("sharp");
-} catch (e) {
-  // If sharp isn't installed, server will still run but /api/sec will error.
-  sharp = null;
-}
+// ----------------------------
+// Config (env overrides allowed)
+// ----------------------------
+const DISTANCE_YARDS = num(process.env.DISTANCE_YARDS, 100);
+const MOA_PER_CLICK = num(process.env.MOA_PER_CLICK, 0.25);
+const TARGET_WIDTH_IN = num(process.env.TARGET_WIDTH_IN, 23);
 
+const MIN_SHOTS = int(process.env.MIN_SHOTS, 3);
+const MAX_SHOTS = int(process.env.MAX_SHOTS, 7);
+const MAX_ABS_CLICKS = num(process.env.MAX_ABS_CLICKS, 80);
+
+const PAPER_WHITE_THRESH = int(process.env.PAPER_WHITE_THRESH, 230);
+const DARK_THRESH = int(process.env.DARK_THRESH, 80);
+
+const AREA_FRAC_MIN = num(process.env.AREA_FRAC_MIN, 0.60);
+const ASPECT_MIN = num(process.env.ASPECT_MIN, 0.85);
+const ASPECT_MAX = num(process.env.ASPECT_MAX, 1.15);
+
+const MAX_PROCESS_W = int(process.env.MAX_PROCESS_W, 1100);
+const PORT = int(process.env.PORT, 10000);
+
+// ----------------------------
+// App + middleware
+// ----------------------------
 const app = express();
 app.use(cors());
 app.use(express.json({ limit: "1mb" }));
 
 const upload = multer({
   storage: multer.memoryStorage(),
-  limits: {
-    fileSize: 8 * 1024 * 1024, // 8MB
-  },
+  limits: { fileSize: 8 * 1024 * 1024 }, // 8MB
 });
 
-const TARGET_WIDTH_IN = 23;
-const TARGET_HEIGHT_IN = 23;
-
-// 1 MOA ≈ 1.047" at 100 yards
-function inchesPerMoa(distanceYards) {
-  return (Number(distanceYards) * 1.047) / 100;
+// ----------------------------
+// Helpers
+// ----------------------------
+function num(v, d) {
+  const n = parseFloat(v);
+  return Number.isFinite(n) ? n : d;
+}
+function int(v, d) {
+  const n = parseInt(v, 10);
+  return Number.isFinite(n) ? n : d;
+}
+function clamp(v, lo, hi) {
+  return Math.max(lo, Math.min(hi, v));
+}
+function round2(x) {
+  return Math.round(x * 100) / 100;
+}
+function inchesPerClick(distanceYards, moaPerClick) {
+  // 1 MOA ~= 1.047" at 100 yards
+  return 1.047 * moaPerClick * (distanceYards / 100);
+}
+function isWhite(r, g, b) {
+  return r >= PAPER_WHITE_THRESH && g >= PAPER_WHITE_THRESH && b >= PAPER_WHITE_THRESH;
+}
+function isDark(r, g, b) {
+  return r <= DARK_THRESH && g <= DARK_THRESH && b <= DARK_THRESH;
 }
 
-function clamp(n, a, b) {
-  return Math.max(a, Math.min(b, n));
-}
+async function loadRGBA(buffer) {
+  let img = sharp(buffer, { failOnError: false }).rotate(); // respect EXIF
+  const meta = await img.metadata();
+  const w0 = meta.width || 0;
+  const h0 = meta.height || 0;
+  if (!w0 || !h0) throw new Error("Could not read image dimensions.");
 
-function toBool(v) {
-  if (typeof v === "boolean") return v;
-  if (typeof v === "number") return v !== 0;
-  if (typeof v === "string") return v.toLowerCase() === "true" || v === "1" || v.toLowerCase() === "yes";
-  return false;
-}
-
-/**
- * Convert image to grayscale raw pixels with optional downscale for speed.
- * Returns: { w, h, gray } where gray is Uint8Array length w*h (0=black,255=white)
- */
-async function decodeToGray(buffer) {
-  if (!sharp) {
-    throw new Error("sharp is not installed. Install it or switch pipeline to an installed image lib.");
+  if (w0 > MAX_PROCESS_W) {
+    img = img.resize({ width: MAX_PROCESS_W, withoutEnlargement: true });
   }
 
-  // Downscale large images to keep CPU reasonable
-  const meta = await sharp(buffer).metadata();
-  let w = meta.width || 0;
-  let h = meta.height || 0;
-  if (!w || !h) throw new Error("Could not read image dimensions.");
+  const outMeta = await img.metadata();
+  const w = outMeta.width;
+  const h = outMeta.height;
 
-  const maxEdge = 1800;
-  let resizeW = w;
-  let resizeH = h;
-  if (Math.max(w, h) > maxEdge) {
-    const scale = maxEdge / Math.max(w, h);
-    resizeW = Math.round(w * scale);
-    resizeH = Math.round(h * scale);
-  }
-
-  const { data, info } = await sharp(buffer)
-    .rotate() // respect EXIF orientation
-    .resize(resizeW, resizeH, { fit: "inside" })
-    .grayscale()
-    .raw()
-    .toBuffer({ resolveWithObject: true });
-
-  return {
-    w: info.width,
-    h: info.height,
-    gray: new Uint8Array(data),
-  };
+  const data = await img.ensureAlpha().raw().toBuffer(); // RGBA
+  return { data: new Uint8Array(data), w, h };
 }
 
-/**
- * Find a "target-like" region (bounding box) based on dark border pixels.
- * Very simple heuristic:
- * - Identify pixels below a dynamic threshold (dark)
- * - Get bounding box of those pixels
- * - Compute areaFrac + aspect ratio
- */
-function detectTargetRegion(gray, w, h) {
-  // Build histogram for threshold
-  const hist = new Array(256).fill(0);
-  for (let i = 0; i < gray.length; i++) hist[gray[i]]++;
-
-  // Find threshold so that ~3–6% of pixels are considered "dark"
-  const total = gray.length;
-  let cum = 0;
-  let threshold = 120; // fallback
-  const targetDarkFrac = 0.04;
-  for (let t = 0; t < 256; t++) {
-    cum += hist[t];
-    if (cum / total >= targetDarkFrac) {
-      threshold = t;
-      break;
-    }
-  }
-  threshold = clamp(threshold + 20, 60, 180); // bump slightly (borders can be lighter)
-
+function findNonWhiteBBox(rgba, w, h) {
   let minX = w, minY = h, maxX = -1, maxY = -1;
-  let darkCount = 0;
 
   for (let y = 0; y < h; y++) {
-    const row = y * w;
+    let row = y * w * 4;
     for (let x = 0; x < w; x++) {
-      const v = gray[row + x];
-      if (v <= threshold) {
-        darkCount++;
+      const i = row + x * 4;
+      const r = rgba[i], g = rgba[i + 1], b = rgba[i + 2];
+      if (!isWhite(r, g, b)) {
         if (x < minX) minX = x;
         if (y < minY) minY = y;
         if (x > maxX) maxX = x;
@@ -138,380 +114,237 @@ function detectTargetRegion(gray, w, h) {
     }
   }
 
-  if (maxX < 0 || maxY < 0) {
-    return {
-      ok: false,
-      error: "No dark structure found.",
-      debug: { threshold, darkFrac: 0, areaFrac: 0, aspect: 0 },
-    };
-  }
+  if (maxX < 0 || maxY < 0) return null;
 
-  const boxW = maxX - minX + 1;
-  const boxH = maxY - minY + 1;
+  const width = maxX - minX + 1;
+  const height = maxY - minY + 1;
+  const areaFrac = (width * height) / (w * h);
+  const aspect = width / height;
 
-  const areaFrac = (boxW * boxH) / (w * h);
-  const aspect = boxW / boxH;
-  const darkFrac = darkCount / total;
-  const whiteFrac = 1 - darkFrac;
-
-  // Heuristics similar to what you’ve seen in debug:
-  // - Need most of frame to be target
-  // - Aspect should be roughly square (but allow some perspective)
-  const looksLikeFullTarget = areaFrac >= 0.60 && aspect >= 0.70 && aspect <= 1.45;
-
-  if (!looksLikeFullTarget) {
-    return {
-      ok: false,
-      error: "Image rejected: does not look like a full target in-frame.",
-      debug: {
-        threshold,
-        whiteFrac: Number(whiteFrac.toFixed(2)),
-        darkFrac: Number(darkFrac.toFixed(2)),
-        areaFrac: Number(areaFrac.toFixed(2)),
-        aspect: Number(aspect.toFixed(2)),
-      },
-    };
-  }
-
-  return {
-    ok: true,
-    region: { x: minX, y: minY, width: boxW, height: boxH },
-    debug: {
-      threshold,
-      whiteFrac: Number(whiteFrac.toFixed(2)),
-      darkFrac: Number(darkFrac.toFixed(2)),
-      areaFrac: Number(areaFrac.toFixed(2)),
-      aspect: Number(aspect.toFixed(2)),
-    },
-  };
+  return { x0: minX, y0: minY, x1: maxX, y1: maxY, width, height, areaFrac, aspect };
 }
 
-/**
- * Detect bullet holes as dark blobs inside the detected target region.
- * Simple connected-components over a downsampled mask for speed.
- */
-function detectShots(gray, w, h, region, threshold) {
-  // Work only inside region
-  const rx0 = region.x;
-  const ry0 = region.y;
-  const rx1 = region.x + region.width - 1;
-  const ry1 = region.y + region.height - 1;
+function findDarkBlobs(rgba, w, h, bbox) {
+  const { x0, y0, x1, y1 } = bbox;
+  const bw = x1 - x0 + 1;
+  const bh = y1 - y0 + 1;
 
-  // Build binary mask (dark pixels)
-  const mask = new Uint8Array(region.width * region.height);
-  let idx = 0;
-  let candidates = 0;
+  const mask = new Uint8Array(bw * bh);
 
-  for (let y = ry0; y <= ry1; y++) {
-    const row = y * w;
-    for (let x = rx0; x <= rx1; x++) {
-      const v = gray[row + x];
-      const on = v <= threshold ? 1 : 0;
-      mask[idx++] = on;
-      if (on) candidates++;
+  for (let y = 0; y < bh; y++) {
+    const yy = y0 + y;
+    let row = (yy * w + x0) * 4;
+    for (let x = 0; x < bw; x++) {
+      const i = row + x * 4;
+      const r = rgba[i], g = rgba[i + 1], b = rgba[i + 2];
+      const idx = y * bw + x;
+      if (isDark(r, g, b)) mask[idx] = 1;
     }
   }
 
-  // Connected components on mask
-  const rw = region.width;
-  const rh = region.height;
-  const visited = new Uint8Array(mask.length);
-
-  function at(x, y) {
-    return mask[y * rw + x];
-  }
-
+  const visited = new Uint8Array(bw * bh);
   const blobs = [];
+  const stack = [];
 
-  const qx = [];
-  const qy = [];
+  const minArea = 12;     // reject tiny noise
+  const maxArea = 20000;  // reject huge fills
 
-  for (let y = 0; y < rh; y++) {
-    for (let x = 0; x < rw; x++) {
-      const mIndex = y * rw + x;
-      if (!mask[mIndex] || visited[mIndex]) continue;
+  for (let y = 0; y < bh; y++) {
+    for (let x = 0; x < bw; x++) {
+      const idx = y * bw + x;
+      if (!mask[idx] || visited[idx]) continue;
 
-      // BFS
-      visited[mIndex] = 1;
-      qx.length = 0;
-      qy.length = 0;
-      qx.push(x);
-      qy.push(y);
+      visited[idx] = 1;
+      stack.push(idx);
 
-      let count = 0;
+      let area = 0;
       let sumX = 0;
       let sumY = 0;
 
-      while (qx.length) {
-        const cx = qx.pop();
-        const cy = qy.pop();
-        count++;
+      while (stack.length) {
+        const cur = stack.pop();
+        const cy = Math.floor(cur / bw);
+        const cx = cur - cy * bw;
+
+        area++;
         sumX += cx;
         sumY += cy;
 
-        // 4-neighbor
-        const n1x = cx - 1, n1y = cy;
-        const n2x = cx + 1, n2y = cy;
-        const n3x = cx, n3y = cy - 1;
-        const n4x = cx, n4y = cy + 1;
-
-        if (n1x >= 0) {
-          const i = n1y * rw + n1x;
-          if (at(n1x, n1y) && !visited[i]) { visited[i] = 1; qx.push(n1x); qy.push(n1y); }
+        if (cx > 0) {
+          const n = cur - 1;
+          if (mask[n] && !visited[n]) {
+            visited[n] = 1;
+            stack.push(n);
+          }
         }
-        if (n2x < rw) {
-          const i = n2y * rw + n2x;
-          if (at(n2x, n2y) && !visited[i]) { visited[i] = 1; qx.push(n2x); qy.push(n2y); }
+        if (cx + 1 < bw) {
+          const n = cur + 1;
+          if (mask[n] && !visited[n]) {
+            visited[n] = 1;
+            stack.push(n);
+          }
         }
-        if (n3y >= 0) {
-          const i = n3y * rw + n3x;
-          if (at(n3x, n3y) && !visited[i]) { visited[i] = 1; qx.push(n3x); qy.push(n3y); }
+        if (cy > 0) {
+          const n = cur - bw;
+          if (mask[n] && !visited[n]) {
+            visited[n] = 1;
+            stack.push(n);
+          }
         }
-        if (n4y < rh) {
-          const i = n4y * rw + n4x;
-          if (at(n4x, n4y) && !visited[i]) { visited[i] = 1; qx.push(n4x); qy.push(n4y); }
+        if (cy + 1 < bh) {
+          const n = cur + bw;
+          if (mask[n] && !visited[n]) {
+            visited[n] = 1;
+            stack.push(n);
+          }
         }
       }
 
-      // Filter out tiny noise & huge border blobs
-      // (These bounds are intentionally broad; tune later if needed)
-      if (count >= 20 && count <= 1200) {
+      if (area >= minArea && area <= maxArea) {
         blobs.push({
-          area: count,
-          cx: sumX / count,
-          cy: sumY / count,
+          area,
+          cx: x0 + (sumX / area),
+          cy: y0 + (sumY / area),
         });
       }
     }
   }
 
-  // Convert blob centers to absolute image coords
-  const shots = blobs.map(b => ({
-    area: b.area,
-    x: rx0 + b.cx,
-    y: ry0 + b.cy,
-  }));
-
-  return {
-    shots,
-    candidates,
-  };
+  return blobs;
 }
 
-/**
- * Choose shotsUsed and compute POIB (mean center).
- * Keeps it simple: choose up to N closest to target center.
- */
-function computePOIB(shots, targetCx, targetCy, maxUse = 7) {
-  if (!shots.length) return { ok: false, error: "Image rejected: not enough shots detected (0)." };
+async function computeSEC(buffer, opts) {
+  const convention = String(opts.convention || "DIAL_TO_CENTER").toUpperCase();
+  const distanceYards = num(opts.distanceYards, DISTANCE_YARDS);
+  const moaPerClick = num(opts.moaPerClick, MOA_PER_CLICK);
+  const targetWidthIn = num(opts.targetWidthIn, TARGET_WIDTH_IN);
 
-  // Sort by distance to target center (bias toward cluster near bull)
-  const sorted = shots
-    .map(s => {
-      const dx = s.x - targetCx;
-      const dy = s.y - targetCy;
-      return { ...s, d2: dx * dx + dy * dy };
-    })
-    .sort((a, b) => a.d2 - b.d2);
+  const { data, w, h } = await loadRGBA(buffer);
+  const bbox = findNonWhiteBBox(data, w, h);
 
-  const used = sorted.slice(0, Math.min(maxUse, sorted.length));
+  if (!bbox) {
+    const e = new Error("Image rejected: does not look like a full target in-frame.");
+    e.status = 422;
+    throw e;
+  }
 
-  let sumX = 0, sumY = 0;
+  if (bbox.areaFrac < AREA_FRAC_MIN || bbox.aspect < ASPECT_MIN || bbox.aspect > ASPECT_MAX) {
+    const e = new Error("Image rejected: does not look like a full target in-frame.");
+    e.status = 422;
+    throw e;
+  }
+
+  const blobs = findDarkBlobs(data, w, h, bbox);
+  blobs.sort((a, b) => b.area - a.area);
+
+  if (blobs.length < MIN_SHOTS) {
+    const e = new Error(`Image rejected: not enough shots detected (${blobs.length}).`);
+    e.status = 422;
+    throw e;
+  }
+
+  const used = blobs.slice(0, MAX_SHOTS);
+
+  let shotCx = 0;
+  let shotCy = 0;
   for (const s of used) {
-    sumX += s.x;
-    sumY += s.y;
+    shotCx += s.cx;
+    shotCy += s.cy;
+  }
+  shotCx /= used.length;
+  shotCy /= used.length;
+
+  const targetCx = bbox.x0 + bbox.width / 2;
+  const targetCy = bbox.y0 + bbox.height / 2;
+
+  const dxPx = shotCx - targetCx;
+  const dyPx = shotCy - targetCy;
+
+  const inPerPx = targetWidthIn / bbox.width;
+  const dxIn = dxPx * inPerPx;
+  const dyIn = dyPx * inPerPx;
+
+  const ipc = inchesPerClick(distanceYards, moaPerClick);
+
+  // Convention defaults to DIAL_TO_CENTER:
+  // dxIn > 0 (impact right) -> dial left (negative wind)
+  // dyIn < 0 (impact high)  -> dial down (negative elev)
+  let windClicks = 0;
+  let elevClicks = 0;
+
+  if (convention === "DIAL_TO_GROUP") {
+    windClicks = dxIn / ipc;
+    elevClicks = dyIn / ipc;
+  } else {
+    windClicks = -dxIn / ipc;
+    elevClicks = dyIn / ipc;
   }
 
-  return {
-    ok: true,
-    poibCx: sumX / used.length,
-    poibCy: sumY / used.length,
-    shotsUsed: used.length,
-    shotsDetected: shots.length,
-  };
-}
+  windClicks = clamp(windClicks, -MAX_ABS_CLICKS, MAX_ABS_CLICKS);
+  elevClicks = clamp(elevClicks, -MAX_ABS_CLICKS, MAX_ABS_CLICKS);
 
-/**
- * ENGINE: px -> inches -> MOA -> clicks
- * Fix: separate X/Y scale
- */
-function computeClicks(params) {
-  const {
-    poibCx,
-    poibCy,
-    targetCx,
-    targetCy,
-    region,
-    distanceYards,
-    moaPerClick,
+  return {
+    units: "CLICKS",
     convention,
-    flipWindage,
-    flipElevation,
-  } = params;
-
-  const dxPx = poibCx - targetCx;
-  const dyPx = poibCy - targetCy;
-
-  // FIX: separate scaling (X uses region.width; Y uses region.height)
-  const inPerPxX = TARGET_WIDTH_IN / region.width;
-  const inPerPxY = TARGET_HEIGHT_IN / region.height;
-
-  const dxIn = dxPx * inPerPxX;
-  const dyIn = dyPx * inPerPxY;
-
-  const ipm = inchesPerMoa(distanceYards);
-
-  const windMoaRaw = dxIn / ipm;
-  const elevMoaRaw = dyIn / ipm;
-
-  const windClicksRaw = windMoaRaw / moaPerClick;
-  const elevClicksRaw = elevMoaRaw / moaPerClick;
-
-  let windClicks = windClicksRaw;
-  let elevClicks = elevClicksRaw;
-
-  // Convention matches your UI descriptions
-  if (convention === "DIAL_TO_CENTER") {
-    // impacts RIGHT => dial LEFT  (invert windage)
-    // impacts LOW   => dial UP    (keep elev sign; dy+ => + clicks => UP)
-    windClicks = -windClicksRaw;
-    elevClicks = elevClicksRaw;
-  } else if (convention === "DIAL_TO_GROUP") {
-    // dial toward impacts:
-    // impacts RIGHT => dial RIGHT (keep wind)
-    // impacts LOW   => dial DOWN  (invert elev)
-    windClicks = windClicksRaw;
-    elevClicks = -elevClicksRaw;
-  }
-
-  if (flipWindage) windClicks *= -1;
-  if (flipElevation) elevClicks *= -1;
-
-  // Round to 2 decimals for SEC
-  const windage_clicks = Math.round(windClicks * 100) / 100;
-  const elevation_clicks = Math.round(elevClicks * 100) / 100;
-
-  return {
-    windage_clicks,
-    elevation_clicks,
-    debug: {
-      dxPx: Number(dxPx.toFixed(2)),
-      dyPx: Number(dyPx.toFixed(2)),
-      inPerPxX: Number(inPerPxX.toFixed(6)),
-      inPerPxY: Number(inPerPxY.toFixed(6)),
-      dxIn: Number(dxIn.toFixed(3)),
-      dyIn: Number(dyIn.toFixed(3)),
-      inchesPerMoa: Number(ipm.toFixed(6)),
-      windMoaRaw: Number(windMoaRaw.toFixed(4)),
-      elevMoaRaw: Number(elevMoaRaw.toFixed(4)),
-      windClicksRaw: Number(windClicksRaw.toFixed(4)),
-      elevClicksRaw: Number(elevClicksRaw.toFixed(4)),
+    sec: {
+      windage_clicks: round2(windClicks),
+      elevation_clicks: round2(elevClicks),
     },
   };
 }
 
-// -------------------- Routes --------------------
-
-app.get("/", (req, res) => {
-  res.type("text").send("SCZN3 SEC Backend is up");
+// ----------------------------
+// Routes
+// ----------------------------
+app.get("/", (_req, res) => {
+  res.type("text/plain").send("SCZN3 SEC Backend is up");
 });
 
-app.get("/healthz", (req, res) => {
+app.get("/api/health", (_req, res) => {
   res.json({ ok: true });
 });
 
 app.post("/api/sec", upload.single("file"), async (req, res) => {
   try {
-    if (!sharp) {
-      return res.status(500).json({ ok: false, error: "Server missing dependency: sharp" });
-    }
-
     if (!req.file || !req.file.buffer) {
-      return res.status(400).json({ ok: false, error: "No image uploaded. Field name must be: file" });
-    }
-
-    // Defaults (normalized)
-    const distanceYards = Number(req.body?.distanceYards ?? 100);
-    const moaPerClick = Number(req.body?.moaPerClick ?? 0.25);
-    const convention = String(req.body?.convention ?? "DIAL_TO_CENTER");
-    const flipWindage = toBool(req.body?.flipWindage ?? false);
-    const flipElevation = toBool(req.body?.flipElevation ?? false);
-
-    const { w, h, gray } = await decodeToGray(req.file.buffer);
-
-    // 1) Detect target region
-    const regionResult = detectTargetRegion(gray, w, h);
-    if (!regionResult.ok) {
-      return res.status(422).json({
+      return res.status(400).json({
         ok: false,
-        error: regionResult.error,
-        debug: regionResult.debug,
-      });
-    }
-    const region = regionResult.region;
-
-    // 2) Target center
-    const targetCx = region.x + region.width / 2;
-    const targetCy = region.y + region.height / 2;
-
-    // 3) Detect shots
-    // Use a slightly darker threshold for shot candidates than border threshold
-    const shotThreshold = clamp(regionResult.debug.threshold - 10, 40, 170);
-    const shotResult = detectShots(gray, w, h, region, shotThreshold);
-
-    // 4) Compute POIB (mean of chosen shots)
-    const poib = computePOIB(shotResult.shots, targetCx, targetCy, 7);
-    if (!poib.ok) {
-      return res.status(422).json({
-        ok: false,
-        error: poib.error,
-        debug: {
-          threshold: shotThreshold,
-          candidates: shotResult.candidates,
-        },
+        error: "No image uploaded. Field name must be: file",
       });
     }
 
-    // 5) Compute clicks (ENGINE)
-    const clicks = computeClicks({
-      poibCx: poib.poibCx,
-      poibCy: poib.poibCy,
-      targetCx,
-      targetCy,
-      region,
+    const convention = req.body?.convention || req.query?.convention || "DIAL_TO_CENTER";
+    const distanceYards =
+      req.body?.distanceYards || req.body?.distance_yards || req.query?.distanceYards || req.query?.distance_yards;
+    const moaPerClick =
+      req.body?.moaPerClick || req.body?.moa_per_click || req.query?.moaPerClick || req.query?.moa_per_click;
+    const targetWidthIn =
+      req.body?.targetWidthIn || req.body?.target_width_in || req.query?.targetWidthIn || req.query?.target_width_in;
+
+    const out = await computeSEC(req.file.buffer, {
+      convention,
       distanceYards,
       moaPerClick,
-      convention,
-      flipWindage,
-      flipElevation,
+      targetWidthIn,
     });
 
-    // Response (matches your Hoppscotch + debug panel pattern)
-    return res.status(200).json({
+    res.json({
       ok: true,
-      units: "CLICKS",
-      convention,
-      sec: {
-        windage_clicks: clicks.windage_clicks,
-        elevation_clicks: clicks.elevation_clicks,
-      },
-      debug: {
-        ...regionResult.debug,
-        shotsDetected: poib.shotsDetected,
-        shotsUsed: poib.shotsUsed,
-        threshold: shotThreshold,
-        ...clicks.debug,
-      },
+      units: out.units,
+      convention: out.convention,
+      sec: out.sec,
     });
   } catch (err) {
-    const msg = err && err.message ? err.message : "Unknown server error";
-    return res.status(500).json({ ok: false, error: msg });
+    res.status(err.status || 500).json({
+      ok: false,
+      error: err.message || "Server error",
+    });
   }
 });
 
-// -------------------- Start --------------------
-
-const PORT = process.env.PORT || 3000;
+// ----------------------------
+// Start
+// ----------------------------
 app.listen(PORT, () => {
-  console.log(`SCZN3 SEC Backend listening on port ${PORT}`);
+  console.log(`SCZN3 SEC backend listening on :${PORT}`);
 });
