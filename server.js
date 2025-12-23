@@ -281,7 +281,7 @@ function computeSEC({ shotCenterPx, region }) {
 
   // Convention: DIAL_TO_CENTER
   const windage = clampAbs(-dxIn / ipc, CONFIG.MAX_ABS_CLICKS);
-  const elevation = clampAbs(dyIn / ipc, CONFIG.MAX_ABS_CLICKS);
+  const elevation = clampAbs(-dyIn / ipc, CONFIG.MAX_ABS_CLICKS);
 
   return {
     windage_clicks: round2(windage),
