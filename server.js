@@ -288,7 +288,13 @@ function computeSEC({ shotCenterPx, region }) {
     elevation_clicks: round2(elevation),
   };
 }
-
+app.get("/api/sec", (_req, res) => {
+  return res.status(200).json({
+    ok: true,
+    route: "/api/sec",
+    message: "Backend is live. Use POST /api/sec for SEC requests.",
+  });
+});
 app.get("/", (_req, res) => res.type("text/plain").send("up"));
 
 app.get("/api/health", (_req, res) => {
